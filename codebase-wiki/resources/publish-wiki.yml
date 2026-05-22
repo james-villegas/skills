@@ -1,0 +1,91 @@
+name: Publish wiki
+
+# Mirrors the markdown docs in .claude/wiki/ into this repo's GitHub Wiki
+# (a separate git repo at <repo>.wiki.git). Runs whenever the docs change on
+# develop, and can be triggered manually.
+#
+# The source docs are authored for Obsidian (YAML frontmatter + [[wikilinks]]).
+# This job transforms them into GitHub-Wiki-friendly markdown on the way out,
+# so the source stays Obsidian-compatible and the wiki renders cleanly.
+#
+# The wiki is a ONE-WAY MIRROR of .claude/wiki/ — edit the docs there, never in
+# the wiki web editor; hand edits (and any pages not in the source) are
+# overwritten/removed on the next sync.
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - '.claude/wiki/**'
+      - '.github/workflows/publish-wiki.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never let two publishes race against the wiki repo.
+concurrency:
+  group: publish-wiki
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync .claude/wiki to the GitHub Wiki
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -d .claude/wiki ]; then
+            echo "::error::.claude/wiki directory not found"; exit 1
+          fi
+
+          tmp="$(mktemp -d)"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" \
+            "$tmp"
+
+          # Replace the wiki's tracked content with the repo's docs, but keep .git.
+          # Note: GitHub Wiki is a flat namespace — subdirectories under
+          # .claude/wiki/ would not render as pages.
+          find "$tmp" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -R .claude/wiki/. "$tmp"/
+
+          # Obsidian -> GitHub Wiki transforms, applied to every page:
+          #   1. Strip a leading YAML frontmatter block (GH renders it as raw text).
+          #   2. Drop the .md extension from links — wiki page URLs have none:
+          #        [[Page.md]]      -> [[Page]]   (also |alias and #anchor forms)
+          #        [text](Page.md)  -> [text](Page)  (also #anchor form)
+          for f in "$tmp"/*.md; do
+            awk 'NR==1 && /^---[[:space:]]*$/ {fm=1; next}
+                 fm && /^---[[:space:]]*$/ {fm=0; next}
+                 !fm' "$f" > "$f.tmp"
+            sed -E -e 's/(\[\[[^]|#]+)\.md([]|#])/\1\2/g' \
+                   -e 's/(\]\([^):# ]+)\.md([)#])/\1\2/g' \
+                   "$f.tmp" > "$f"
+            rm -f "$f.tmp"
+          done
+
+          # The wiki landing page must be named Home.md; seed it from the
+          # (already-transformed) INDEX.md so the index is the wiki home.
+          if [ -f "$tmp/INDEX.md" ]; then
+            cp "$tmp/INDEX.md" "$tmp/Home.md"
+          fi
+
+          cd "$tmp"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Wiki already up to date; nothing to publish."
+            exit 0
+          fi
+
+          git commit -m "docs: sync wiki from .claude/wiki @ ${GITHUB_SHA::7}"
+          git push origin HEAD:master
